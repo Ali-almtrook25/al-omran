@@ -24,10 +24,18 @@ type UpdateStage = {
 };
 
 const weeklyOffersSourceSelect = `
-SELECT TOP (1000)
+SELECT
   [Oid],
   [No_],
   [DealPerPiece]
+FROM [BackOffice].[dbo].[WeeklyOffersList]
+WHERE [Oid] = @oid
+ORDER BY [No_] ASC
+OFFSET @offset ROWS FETCH NEXT @batchSize ROWS ONLY
+`;
+
+const weeklyOffersSourceCountSelect = `
+SELECT COUNT(1) AS [TotalCount]
 FROM [BackOffice].[dbo].[WeeklyOffersList]
 WHERE [Oid] = @oid
 `;
@@ -154,6 +162,9 @@ export async function POST(request: NextRequest) {
 
   const oid = Number(body?.oid);
   const offerNo = String(body?.offerNo || '').trim();
+  const offset = Number(body?.offset ?? 0);
+  const requestedBatchSize = Number(body?.batchSize ?? 100);
+  const batchSize = Math.min(Math.max(Number.isNaN(requestedBatchSize) ? 100 : requestedBatchSize, 1), 500);
 
   addStage('validate_input', 'Started input validation');
 
@@ -165,6 +176,10 @@ export async function POST(request: NextRequest) {
     return NextResponse.json<ApiResponse>({ success: false, error: 'offerNo is required' }, { status: 400 });
   }
 
+  if (Number.isNaN(offset) || offset < 0) {
+    return NextResponse.json<ApiResponse>({ success: false, error: 'offset must be a non-negative number' }, { status: 400 });
+  }
+
   addStage('validate_input', 'Input validation completed');
 
   try {
@@ -173,17 +188,41 @@ export async function POST(request: NextRequest) {
     const pool2 = await getSqlPool2();
     addStage('connect', 'Connected to both databases');
 
-    addStage('fetch_source', `Fetching WeeklyOffersList rows for Oid ${oid}`);
-    const weeklyResult = await pool1.request().input('oid', sql.Int, oid).query(weeklyOffersSourceSelect);
+    addStage('fetch_source', `Fetching WeeklyOffersList rows for Oid ${oid} with offset ${offset} and batchSize ${batchSize}`);
+
+    const countResult = await pool1
+      .request()
+      .input('oid', sql.Int, oid)
+      .query(weeklyOffersSourceCountSelect);
+    const totalSourceItems = Number(countResult.recordset?.[0]?.TotalCount ?? 0);
+
+    const weeklyResult = await pool1
+      .request()
+      .input('oid', sql.Int, oid)
+      .input('offset', sql.Int, offset)
+      .input('batchSize', sql.Int, batchSize)
+      .query(weeklyOffersSourceSelect);
 
     const sourceRows = (weeklyResult.recordset || []) as WeeklySourceRow[];
-    addStage('fetch_source', `Fetched ${sourceRows.length} source rows`);
+    addStage('fetch_source', `Fetched ${sourceRows.length} source rows in current chunk out of ${totalSourceItems}`);
 
     if (sourceRows.length === 0) {
       addStage('finish', 'No source rows found, nothing to update');
       return NextResponse.json<ApiResponse>({
         success: true,
-        data: { items: 0, rowsAffected: 0, stages },
+        data: {
+          items: 0,
+          rowsAffected: 0,
+          totalSourceItems,
+          chunk: {
+            offset,
+            batchSize,
+            processedInChunk: 0,
+            nextOffset: offset,
+            hasMore: false,
+          },
+          stages,
+        },
         message: 'No source rows found in WeeklyOffersList for this Oid',
       });
     }
@@ -234,7 +273,15 @@ export async function POST(request: NextRequest) {
       throw transactionError;
     }
 
-    addStage('finish', 'Update finished successfully');
+    const nextOffset = offset + sourceRows.length;
+    const hasMore = nextOffset < totalSourceItems;
+
+    addStage(
+      'finish',
+      hasMore
+        ? `Chunk finished successfully. Continue from offset ${nextOffset}`
+        : 'Update finished successfully'
+    );
 
     return NextResponse.json<ApiResponse>({
       success: true,
@@ -242,11 +289,21 @@ export async function POST(request: NextRequest) {
         oid,
         offerNo,
         sourceItems: sourceRows.length,
+        totalSourceItems,
         itemsUpdated,
         rowsAffected: totalRowsAffected,
+        chunk: {
+          offset,
+          batchSize,
+          processedInChunk: sourceRows.length,
+          nextOffset,
+          hasMore,
+        },
         stages,
       },
-      message: 'Coupon Discount updated from WeeklyOffersList successfully',
+      message: hasMore
+        ? `Chunk processed successfully (${nextOffset}/${totalSourceItems}). Continue with next chunk.`
+        : 'Coupon Discount updated from WeeklyOffersList successfully',
     });
   } catch (error) {
     addStage('error', error instanceof Error ? error.message : 'Unknown error');

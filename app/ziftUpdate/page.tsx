@@ -7,8 +7,16 @@ type SyncResponse = {
   data?: {
     oid?: number;
     sourceItems?: number;
+    totalSourceItems?: number;
     itemsUpdated?: number;
     rowsAffected?: number;
+    chunk?: {
+      offset: number;
+      batchSize: number;
+      processedInChunk: number;
+      nextOffset: number;
+      hasMore: boolean;
+    };
     stages?: Array<{
       step: string;
       message: string;
@@ -44,30 +52,78 @@ export default function ZiftUpdatePage() {
         throw new Error('Offer No مطلوب');
       }
 
-      setUiStages((prev) => [...prev, 'إرسال طلب التحديث إلى الخادم']);
+      const batchSize = 100;
+      const maxChunks = 100;
 
-      const response = await fetch('/api/zift', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          action: 'updateCouponDiscountByOid',
-          oid: oidNumber,
-          offerNo: offerNo.trim(),
-        }),
-      });
+      let hasMore = true;
+      let offset = 0;
+      let chunksProcessed = 0;
+      let totalSourceItems = 0;
+      let totalItemsUpdated = 0;
+      let totalRowsAffected = 0;
+      const combinedStages: NonNullable<SyncResponse['data']>['stages'] = [];
 
-      setUiStages((prev) => [...prev, 'تم استلام استجابة من الخادم']);
+      while (hasMore) {
+        chunksProcessed += 1;
+        if (chunksProcessed > maxChunks) {
+          throw new Error('تم إيقاف العملية لأن عدد الدفعات كبير جدًا. أعد المحاولة بمعايير أضيق.');
+        }
 
-      const payload: SyncResponse = await response.json();
+        setUiStages((prev) => [...prev, `إرسال الدفعة رقم ${chunksProcessed} إلى الخادم`]);
 
-      if (!response.ok || !payload.success) {
-        throw new Error(payload.error || 'فشل تنفيذ التحديث');
+        const response = await fetch('/api/zift', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            action: 'updateCouponDiscountByOid',
+            oid: oidNumber,
+            offerNo: offerNo.trim(),
+            offset,
+            batchSize,
+          }),
+        });
+
+        const payload: SyncResponse = await response.json();
+
+        if (!response.ok || !payload.success) {
+          throw new Error(payload.error || 'فشل تنفيذ التحديث');
+        }
+
+        const chunkData = payload.data;
+        totalSourceItems = Number(chunkData?.totalSourceItems ?? totalSourceItems);
+        totalItemsUpdated += Number(chunkData?.itemsUpdated ?? 0);
+        totalRowsAffected += Number(chunkData?.rowsAffected ?? 0);
+        if (chunkData?.stages && chunkData.stages.length > 0) {
+          combinedStages.push(...chunkData.stages);
+        }
+
+        hasMore = Boolean(chunkData?.chunk?.hasMore);
+        offset = Number(chunkData?.chunk?.nextOffset ?? offset);
+
+        setUiStages((prev) => [
+          ...prev,
+          `اكتملت الدفعة ${chunksProcessed}: ${(chunkData?.chunk?.nextOffset ?? 0)}/${totalSourceItems}`,
+        ]);
       }
 
-      setResult(payload.data || null);
-      setMessage(payload.message || 'تم تنفيذ التحديث بنجاح');
+      setResult({
+        oid: oidNumber,
+        sourceItems: totalSourceItems,
+        totalSourceItems,
+        itemsUpdated: totalItemsUpdated,
+        rowsAffected: totalRowsAffected,
+        chunk: {
+          offset: 0,
+          batchSize,
+          processedInChunk: totalSourceItems,
+          nextOffset: totalSourceItems,
+          hasMore: false,
+        },
+        stages: combinedStages,
+      });
+      setMessage('تم تنفيذ التحديث بنجاح على كل الدفعات');
       setUiStages((prev) => [...prev, 'اكتملت عملية التحديث']);
     } catch (runError) {
       setResult(null);
