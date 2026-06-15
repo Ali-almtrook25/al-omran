@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { getSqlPool, getSqlPool2, sql } from '@/lib/sqlServer';
 
 export const runtime = 'nodejs';
+export const maxDuration = 120;
 
 type ApiResponse = {
   success: boolean;
@@ -14,13 +15,6 @@ type WeeklySourceRow = {
   Oid: number;
   No_: string;
   DealPerPiece: number | null;
-};
-
-type TargetEntryKeyRow = {
-  StoreNo: string | null;
-  PosTerminalNo: string | null;
-  TransactionNo: string | null;
-  EntryLineNo: string | null;
 };
 
 type UpdateStage = {
@@ -82,22 +76,17 @@ SET tse.[Coupon Discount] = @couponDiscount
 FROM [Al Amer Market Live$Trans_ Sales Entry] tse
 WHERE tse.[Item No_] = @itemNo
   AND CONVERT(NVARCHAR(50), tse.[Promotion No_]) = @offerNo
-  AND CONVERT(NVARCHAR(100), tse.[Store No_]) = @storeNo
-  AND CONVERT(NVARCHAR(100), tse.[POS Terminal No_]) = @posTerminalNo
-  AND CONVERT(NVARCHAR(100), tse.[Transaction No_]) = @transactionNo
-  AND CONVERT(NVARCHAR(100), tse.[Line No_]) = @lineNoValue
 `;
 
-const selectTargetEntryKeys = `
-SELECT
-  CONVERT(NVARCHAR(100), tse.[Store No_]) AS [StoreNo],
-  CONVERT(NVARCHAR(100), tse.[POS Terminal No_]) AS [PosTerminalNo],
-  CONVERT(NVARCHAR(100), tse.[Transaction No_]) AS [TransactionNo],
-  CONVERT(NVARCHAR(100), tse.[Line No_]) AS [EntryLineNo]
-FROM [Al Amer Market Live$Trans_ Sales Entry] tse
-WHERE tse.[Item No_] = @itemNo
-  AND CONVERT(NVARCHAR(50), tse.[Promotion No_]) = @offerNo
-`;
+function isTimeoutLikeError(error: unknown) {
+  const message = error instanceof Error ? error.message.toLowerCase() : String(error).toLowerCase();
+  return (
+    message.includes('timeout') ||
+    message.includes('timed out') ||
+    message.includes('request failed to complete in') ||
+    message.includes('gateway timeout')
+  );
+}
 
 export async function GET(request: NextRequest) {
   const action = request.nextUrl.searchParams.get('action') || 'getWeeklyOffer';
@@ -217,38 +206,21 @@ export async function POST(request: NextRequest) {
           continue;
         }
 
-        const keyRowsResult = await new sql.Request(transaction)
-          .input('itemNo', sql.NVarChar(50), itemNo)
-          .input('offerNo', sql.NVarChar(50), offerNo)
-          .query(selectTargetEntryKeys);
-
-        const keyRows = (keyRowsResult.recordset || []) as TargetEntryKeyRow[];
         processedItems += 1;
 
-        addStage('process_item', `Item ${itemNo}: found ${keyRows.length} target rows, couponDiscount=${couponDiscount}`);
+        const updateResult = await new sql.Request(transaction)
+          .input('itemNo', sql.NVarChar(50), itemNo)
+          .input('offerNo', sql.NVarChar(50), offerNo)
+          .input('couponDiscount', sql.Decimal(18, 4), couponDiscount)
+          .query(updateCouponDiscountByItemAndOid);
 
-        for (const keyRow of keyRows) {
-          const storeNo = String(keyRow.StoreNo ?? '');
-          const posTerminalNo = String(keyRow.PosTerminalNo ?? '');
-          const transactionNo = String(keyRow.TransactionNo ?? '');
-          const lineNo = String(keyRow.EntryLineNo ?? '');
-
-          const updateResult = await new sql.Request(transaction)
-            .input('itemNo', sql.NVarChar(50), itemNo)
-            .input('offerNo', sql.NVarChar(50), offerNo)
-            .input('storeNo', sql.NVarChar(100), storeNo)
-            .input('posTerminalNo', sql.NVarChar(100), posTerminalNo)
-            .input('transactionNo', sql.NVarChar(100), transactionNo)
-            .input('lineNoValue', sql.NVarChar(100), lineNo)
-            .input('couponDiscount', sql.Decimal(18, 4), couponDiscount)
-            .query(updateCouponDiscountByItemAndOid);
-
-          const affected = updateResult.rowsAffected?.[0] ?? 0;
-          totalRowsAffected += affected;
-          if (affected > 0) {
-            itemsUpdated += 1;
-          }
+        const affected = updateResult.rowsAffected?.[0] ?? 0;
+        totalRowsAffected += affected;
+        if (affected > 0) {
+          itemsUpdated += 1;
         }
+
+        addStage('process_item', `Item ${itemNo}: updated ${affected} rows, couponDiscount=${couponDiscount}`);
       }
 
       await transaction.commit();
@@ -279,6 +251,18 @@ export async function POST(request: NextRequest) {
   } catch (error) {
     addStage('error', error instanceof Error ? error.message : 'Unknown error');
     console.error('zift coupon update error:', error);
+
+    if (isTimeoutLikeError(error)) {
+      return NextResponse.json<ApiResponse>(
+        {
+          success: false,
+          error: 'The request timed out while processing database operations. Try a smaller batch or retry.',
+          data: { stages },
+        },
+        { status: 504 }
+      );
+    }
+
     return NextResponse.json<ApiResponse>(
       {
         success: false,
